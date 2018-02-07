@@ -7,7 +7,7 @@ defmodule LoggerCircularBuffer.Client do
             io: nil,
             config: nil
 
-  def init(pid, task, config \\ nil) do
+  def init(pid, task, config \\ []) do
     %__MODULE__{
       pid: pid,
       task: task,

@@ -147,9 +147,21 @@ defmodule RingLogger do
     {:ok, configure(opts)}
   end
 
-  def handle_call({:configure, opts}, _state) do
+  def handle_call({:configure, opts}, curr_module_levels) do
     env = Application.get_env(:logger, __MODULE__, [])
-    opts = Keyword.merge(env, opts)
+    env_mod_levels = env[:module_levels] || %{}
+    opts_mod_levels = opts[:module_levels] || %{}
+
+    module_levels =
+      env_mod_levels
+      |> Map.merge(curr_module_levels)
+      |> Map.merge(opts_mod_levels)
+
+    opts =
+      env
+      |> Keyword.merge(opts)
+      |> Keyword.merge(module_levels: module_levels)
+
     Application.put_env(:logger, __MODULE__, opts)
     {:ok, :ok, configure(opts)}
   end

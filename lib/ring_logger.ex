@@ -14,22 +14,22 @@ defmodule RingLogger do
   config :logger, backends: [RingLogger]
 
   # Set the number of messages to hold in the circular buffer
-  config :logger, RingLogger, max_size: 100
+  config :logger, RingLogger, max_size: 1024
   ```
 
   Or add manually:
 
   ```elixir
   Logger.add_backend(RingLogger)
-  Logger.configure(RingLogger, max_size: 100)
+  Logger.configure(RingLogger, max_size: 1024)
   ```
 
   Once added as a backend, you have two options depending on whether you're
   accessing the `RingLogger` via the IEx prompt or via code.  If you're at the
-  IEx prompt, use the helper methods in here like `attach`, `detach`, `tail`,
-  `grep`, etc. They'll automate a few things behind the scenes. If you're
-  writing a program that needs to get log messages, use `get` or `start_link` a
-  `RingLogger.Client` and call its methods directly.
+  IEx prompt, use the helper methods in here like `attach`, `detach`, `next`,
+  `tail`, `grep`, etc. They'll automate a few things behind the scenes. If
+  you're writing a program that needs to get log messages, use `get` or
+  `start_link` a `RingLogger.Client` and call its methods directly.
   """
 
   alias RingLogger.{Server, Autoclient}
@@ -37,16 +37,24 @@ defmodule RingLogger do
   @typedoc "Option values used by the ring logger"
   @type server_option :: {:max_size, pos_integer()}
 
+  @typedoc "Callback function for printing/paging tail, grep, and next output"
+  @type pager_fun :: (IO.device(), iodata() -> :ok | {:error, term()})
+
   @typedoc "Option values used by client-side functions like `attach` and `tail`"
   @type client_option ::
           {:io, term}
+          | {:pager, pager_fun()}
           | {:color, term}
           | {:metadata, Logger.metadata()}
-          | {:format, String.t()}
+          | {:format, String.t() | custom_formatter}
           | {:level, Logger.level()}
+          | {:module_levels, map()}
 
   @typedoc "A tuple holding a raw, unformatted log entry"
-  @type entry :: {module(), Logger.level(), Logger.message(), Logger.Formatter.time(), keyword()}
+  @type entry ::
+          {module(), Logger.level(), Logger.message(), Logger.Formatter.time(), Logger.metadata()}
+
+  @typep custom_formatter :: {module, function}
 
   #
   # API
@@ -56,11 +64,15 @@ defmodule RingLogger do
   Attach the current IEx session to the logger. It will start printing log messages.
 
   Options include:
-  * `:io` - Defaults to `:stdio`
-  * `:colors` -
-  * `:metadata` - A KV list of additional metadata
-  * `:format` - A custom format string
-  * `:level` - The minimum log level to report.
+
+  * `:io` - output location when printing. Defaults to `:stdio`
+  * `:colors` - a keyword list of coloring options
+  * `:metadata` - a keyword list of additional metadata
+  * `:format` - the format message used to print logs
+  * `:level` - the minimum log level to report by this backend. Note that the `:logger`
+    application's `:level` setting filters log messages prior to `RingLogger`.
+  * `:module_levels` - a map of log level overrides per module. For example,
+    %{MyModule => :error, MyOtherModule => :none}
   """
   @spec attach([client_option]) :: :ok
   defdelegate attach(opts \\ []), to: Autoclient
@@ -72,10 +84,29 @@ defmodule RingLogger do
   defdelegate detach(), to: Autoclient
 
   @doc """
-  Tail the messages in the log.
+  Print the next messages in the log.
+
+  Options include:
+
+  * Options from `attach/1`
+  * `:pager` - a function for printing log messages to the console. Defaults to `IO.binwrite/2`.
   """
-  @spec tail([client_option]) :: :ok | {:error, term()}
-  defdelegate tail(opts \\ []), to: Autoclient
+  @spec next([client_option]) :: :ok | {:error, term()}
+  defdelegate next(opts \\ []), to: Autoclient
+
+  @doc """
+  Print the last n messages in the log.
+
+  Options include:
+
+  * Options from `attach/1`
+  * `:pager` - a function for printing log messages to the console. Defaults to `IO.binwrite/2`.
+  """
+  @spec tail(non_neg_integer(), [client_option]) :: :ok | {:error, term()}
+  def tail(), do: Autoclient.tail(10, [])
+  def tail(opts) when is_list(opts), do: Autoclient.tail(10, opts)
+  def tail(n) when is_integer(n), do: Autoclient.tail(n, [])
+  def tail(n, opts), do: Autoclient.tail(n, opts)
 
   @doc """
   Reset the index into the log for `tail/1` to the oldest entry.
@@ -90,9 +121,14 @@ defmodule RingLogger do
 
   iex> RingLogger.grep(~r/something/)
   :ok
+
+    Options include:
+
+  * Options from `attach/1`
+  * `:pager` - a function for printing log messages to the console. Defaults to `IO.binwrite/2`.
   """
-  @spec grep(Regex.t(), [client_option]) :: :ok | {:error, term()}
-  defdelegate grep(regex, opts \\ []), to: Autoclient
+  @spec grep(Regex.t() | String.t(), [client_option]) :: :ok | {:error, term()}
+  defdelegate grep(regex_or_string, opts \\ []), to: Autoclient
 
   @doc """
   Helper method for formatting log messages per the current client's
@@ -102,10 +138,12 @@ defmodule RingLogger do
   defdelegate format(message), to: Autoclient
 
   @doc """
-  Get all log messages at the specified index and later.
+  Get n log messages starting at the specified index.
+
+  Set n to 0 to get entries to the end
   """
-  @spec get(non_neg_integer()) :: [entry()]
-  defdelegate get(index \\ 0), to: Server
+  @spec get(non_neg_integer(), non_neg_integer()) :: [entry()]
+  defdelegate get(index \\ 0, n \\ 0), to: Server
 
   @doc """
   Update the logger configuration.
@@ -135,10 +173,12 @@ defmodule RingLogger do
   #
   # Logger backend callbacks
   #
+  @spec init(module()) :: {:ok, term()} | {:error, term()}
   def init(__MODULE__) do
     init({__MODULE__, []})
   end
 
+  @spec init({module(), list()}) :: {:ok, term()} | {:error, term()}
   def init({__MODULE__, opts}) when is_list(opts) do
     env = Application.get_env(:logger, __MODULE__, [])
     opts = Keyword.merge(env, opts)
@@ -166,16 +206,19 @@ defmodule RingLogger do
     {:ok, :ok, configure(opts)}
   end
 
-  def handle_event(:flush, state) do
+  def handle_event({level, _group_leader, message}, state) do
+    Server.log(level, message)
     {:ok, state}
   end
 
-  def handle_event({level, _gl, {Logger, _, _, _} = msg}, state) do
-    Server.log({level, msg}, state)
+  def handle_event(:flush, state) do
+    # No flushing needed for RingLogger
     {:ok, state}
   end
 
   def handle_info(_, state) do
+    # Ignore everything else since it's hard to justify RingLogger crashing
+    # on a bad message.
     {:ok, state}
   end
 

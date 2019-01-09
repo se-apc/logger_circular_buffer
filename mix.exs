@@ -4,7 +4,7 @@ defmodule RingLogger.MixProject do
   def project do
     [
       app: :ring_logger,
-      version: "0.4.0",
+      version: "0.6.1",
       elixir: "~> 1.4",
       start_permanent: Mix.env() == :prod,
       description: description(),
@@ -29,7 +29,7 @@ defmodule RingLogger.MixProject do
   end
 
   defp deps do
-    [{:ex_doc, "~> 0.15", only: :dev}]
+    [{:ex_doc, "~> 0.18", only: :dev, runtime: false}]
   end
 
   defp description do
@@ -40,8 +40,7 @@ defmodule RingLogger.MixProject do
 
   defp package do
     [
-      maintainers: ["Justin Schneck", "Frank Hunleth"],
-      licenses: ["Apache 2.0"],
+      licenses: ["Apache-2.0"],
       links: %{"Github" => "https://github.com/nerves-project/ring_logger"}
     ]
   end

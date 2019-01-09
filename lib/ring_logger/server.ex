@@ -8,7 +8,7 @@ defmodule RingLogger.Server do
   defmodule State do
     @moduledoc false
 
-    @default_max_size 100
+    @default_max_size 1024
 
     defstruct clients: [],
               buffer: :queue.new(),
@@ -38,17 +38,22 @@ defmodule RingLogger.Server do
     GenServer.call(__MODULE__, {:detach, client_pid})
   end
 
-  @spec get(non_neg_integer()) :: [RingLogger.entry()]
-  def get(start_index \\ 0) do
-    GenServer.call(__MODULE__, {:get, start_index})
+  @spec get(non_neg_integer(), non_neg_integer()) :: [RingLogger.entry()]
+  def get(start_index, n) do
+    GenServer.call(__MODULE__, {:get, start_index, n})
   end
 
-  def log({level, {Logger, _, _, md}} = msg, module_levels) do
-    module = md[:module]
+  @spec log(
+          Logger.level(),
+          {Logger, Logger.message(), Logger.Formatter.time(), Logger.metadata()}
+        ) :: :ok
+  def log(level, message) do
+    GenServer.cast(__MODULE__, {:log, level, message})
+  end
 
-    if RingLogger.Configuration.meet_level?(module_levels, module, level) do
-      GenServer.cast(__MODULE__, {:log, msg})
-    end
+  @spec tail(non_neg_integer()) :: [RingLogger.entry()]
+  def tail(n) do
+    GenServer.call(__MODULE__, {:tail, n})
   end
 
   def init(opts) do
@@ -68,7 +73,7 @@ defmodule RingLogger.Server do
     {:reply, :ok, detach_client(pid, state)}
   end
 
-  def handle_call({:get, start_index}, _from, state) do
+  def handle_call({:get, start_index, n}, _from, state) do
     resp =
       cond do
         start_index <= state.index ->
@@ -82,11 +87,19 @@ defmodule RingLogger.Server do
           :queue.to_list(buffer_range)
       end
 
-    {:reply, resp, state}
+    paged_resp = if n <= 0, do: resp, else: Enum.take(resp, n)
+
+    {:reply, paged_resp, state}
   end
 
-  def handle_cast({:log, msg}, state) do
-    {:noreply, push(msg, state)}
+  def handle_call({:tail, n}, _from, state) do
+    start = max(0, state.size - n)
+    {_, last_n} = :queue.split(start, state.buffer)
+    {:reply, :queue.to_list(last_n), state}
+  end
+
+  def handle_cast({:log, level, message}, state) do
+    {:noreply, push(level, message, state)}
   end
 
   def handle_info({:DOWN, _ref, _, pid, _reason}, state) do
@@ -146,23 +159,27 @@ defmodule RingLogger.Server do
 
   defp trim(state), do: state
 
-  defp push({level, {mod, msg, ts, md}}, state) do
+  defp push(level, {mod, msg, ts, md}, state) do
     index = state.index + state.size
-    msg = {level, {mod, msg, ts, Keyword.put(md, :index, index)}}
+    log_entry = {level, {mod, msg, ts, Keyword.put(md, :index, index)}}
 
-    state =
-      if state.size == state.max_size do
-        buffer = :queue.drop(state.buffer)
-        %{state | buffer: buffer, index: state.index + 1}
-      else
-        %{state | size: state.size + 1}
-      end
+    Enum.each(state.clients, &send_log(&1, log_entry))
 
-    Enum.each(state.clients, &send_log(&1, msg))
-    %{state | buffer: :queue.in(msg, state.buffer)}
+    ring_insert(state, log_entry)
   end
 
-  defp send_log({client_pid, _ref}, msg) do
-    send(client_pid, {:log, msg})
+  defp ring_insert(state, item) do
+    if state.size == state.max_size do
+      buffer = :queue.drop(state.buffer)
+      buffer = :queue.in(item, buffer)
+      %{state | buffer: buffer, index: state.index + 1}
+    else
+      buffer = :queue.in(item, state.buffer)
+      %{state | buffer: buffer, size: state.size + 1}
+    end
+  end
+
+  defp send_log({client_pid, _ref}, log_entry) do
+    send(client_pid, {:log, log_entry})
   end
 end

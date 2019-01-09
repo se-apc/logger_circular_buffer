@@ -5,16 +5,16 @@ defmodule RingLogger.Autoclient do
   Helper module for `RingLogger.Client` to simplify IEx use
 
   If you're a human, call these functions via `RingLogger.*`. If you're a
-  program, call `RingLogger.Client.start_link/1` to start you're own client and
+  program, call `RingLogger.Client.start_link/1` to start your own client and
   call it directly.
   """
 
   @doc """
   Attach to the logger and print messages as they come in.
   """
-  def attach(config \\ []) do
+  def attach(opts \\ []) do
     with :ok <- check_server_started(),
-         pid <- maybe_create_client(config),
+         pid <- maybe_create_client(opts),
          do: Client.attach(pid)
   end
 
@@ -40,30 +40,39 @@ defmodule RingLogger.Autoclient do
   end
 
   @doc """
-  Print all log messages since the previous time this was called.
+  Print the log messages since the previous time this was called.
   """
-  def tail(config \\ []) do
+  def next(opts \\ []) do
     with :ok <- check_server_started(),
-         pid <- maybe_create_client(config),
-         do: Client.tail(pid)
+         pid <- maybe_create_client(opts),
+         do: Client.next(pid, opts)
+  end
+
+  @doc """
+  Print the most recent log messages.
+  """
+  def tail(n, opts) do
+    with :ok <- check_server_started(),
+         pid <- maybe_create_client(opts),
+         do: Client.tail(pid, n, opts)
   end
 
   @doc """
   Run a regular expression on each entry in the log and print out the matchers.
   """
-  def grep(regex, config \\ []) do
+  def grep(regex_or_string, opts \\ []) do
     with :ok <- check_server_started(),
-         pid <- maybe_create_client(config),
-         do: Client.grep(pid, regex)
+         pid <- maybe_create_client(opts),
+         do: Client.grep(pid, regex_or_string, opts)
   end
 
   @doc """
   Reset the index used to keep track of the position in the log for `tail/1` so
   that the next call to `tail/1` starts back at the oldest entry.
   """
-  def reset(config \\ []) do
+  def reset(opts \\ []) do
     with :ok <- check_server_started(),
-         pid <- maybe_create_client(config),
+         pid <- maybe_create_client(opts),
          do: Client.reset(pid)
   end
 
@@ -72,7 +81,7 @@ defmodule RingLogger.Autoclient do
   """
   def format(message) do
     with :ok <- check_server_started(),
-         pid <- maybe_create_client(),
+         pid <- maybe_create_client([]),
          do: Client.format(pid, message)
   end
 
@@ -114,16 +123,16 @@ defmodule RingLogger.Autoclient do
     end
   end
 
-  defp maybe_create_client(config \\ []) do
+  defp maybe_create_client(opts) do
     case get_client_pid() do
       nil ->
-        {:ok, pid} = Client.start_link(config)
+        {:ok, pid} = Client.start_link(opts)
         Process.put(:ring_logger_client, pid)
         pid
 
       pid ->
         # Update the configuration if the user changed something
-        Client.configure(pid, config)
+        Client.configure(pid, opts)
         pid
     end
   end

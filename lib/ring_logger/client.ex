@@ -15,7 +15,7 @@ defmodule RingLogger.Client do
               format: nil,
               level: nil,
               index: 0,
-              location: false
+              module_levels: %{}
   end
 
   @doc """
@@ -40,7 +40,8 @@ defmodule RingLogger.Client do
   * `:io` - Defaults to `:stdio`
   * `:colors` -
   * `:metadata` - A KV list of additional metadata
-  * `:format` - A custom format string
+  * `:format` - A custom format string, or a {module, function} tuple (see
+    https://hexdocs.pm/logger/master/Logger.html#module-custom-formatting)
   * `:level` - The minimum log level to report.
   * `:location` - Include the module + function in message
   """
@@ -66,11 +67,33 @@ defmodule RingLogger.Client do
   end
 
   @doc """
-  Tail the messages in the log.
+  Get the last n messages.
+
+  Supported options:
+
+  * `:pager` - an optional 2-arity function that takes an IO device and what to print
   """
-  @spec tail(GenServer.server()) :: :ok
-  def tail(client_pid) do
-    GenServer.call(client_pid, :tail)
+  @spec tail(GenServer.server(), non_neg_integer()) :: :ok | {:error, term()}
+  def tail(client_pid, n, opts \\ []) do
+    {io, to_print} = GenServer.call(client_pid, {:tail, n})
+
+    pager = Keyword.get(opts, :pager, &IO.binwrite/2)
+    pager.(io, to_print)
+  end
+
+  @doc """
+  Get the next set of the messages in the log.
+
+  Supported options:
+
+  * `:pager` - an optional 2-arity function that takes an IO device and what to print
+  """
+  @spec next(GenServer.server(), keyword()) :: :ok | {:error, term()}
+  def next(client_pid, opts \\ []) do
+    {io, to_print} = GenServer.call(client_pid, :next)
+
+    pager = Keyword.get(opts, :pager, &IO.binwrite/2)
+    pager.(io, to_print)
   end
 
   @doc """
@@ -92,10 +115,29 @@ defmodule RingLogger.Client do
 
   @doc """
   Run a regular expression on each entry in the log and print out the matchers.
+
+  Supported options:
+
+  * `:pager` - an optional 2-arity function that takes an IO device and what to print
   """
-  @spec grep(GenServer.server(), Regex.t()) :: :ok
-  def grep(client_pid, regex) do
-    GenServer.call(client_pid, {:grep, regex})
+  @spec grep(GenServer.server(), String.t() | Regex.t(), keyword()) :: :ok | {:error, term()}
+  def grep(client_pid, regex_or_string, opts \\ [])
+
+  def grep(client_pid, regex_string, opts) when is_binary(regex_string) do
+    with {:ok, regex} <- Regex.compile(regex_string) do
+      grep(client_pid, regex, opts)
+    end
+  end
+
+  def grep(client_pid, %Regex{} = regex, opts) do
+    {io, to_print} = GenServer.call(client_pid, {:grep, regex})
+
+    pager = Keyword.get(opts, :pager, &IO.binwrite/2)
+    pager.(io, to_print)
+  end
+
+  def grep(_client_pid, _regex, _opts) do
+    {:error, :invalid_regex}
   end
 
   def init(config) do
@@ -111,9 +153,9 @@ defmodule RingLogger.Client do
       io: Keyword.get(config, :io, :stdio),
       colors: configure_colors(config),
       metadata: Keyword.get(config, :metadata, []) |> configure_metadata(),
-      format: Logger.Formatter.compile(Keyword.get(config, :format)),
+      format: Keyword.get(config, :format) |> configure_formatter(),
       level: Keyword.get(config, :level, :debug),
-      location: Keyword.get(config, :location, false)
+      module_levels: Keyword.get(config, :module_levels, %{})
     }
 
     {:ok, state}
@@ -125,12 +167,8 @@ defmodule RingLogger.Client do
   end
 
   def handle_call({:config, config}, _from, state) do
-    new_io = Keyword.get(config, :io, state.io)
-    new_level = Keyword.get(config, :level, state.level)
-
-    new_state = %State{state | io: new_io, level: new_level}
-
-    {:reply, :ok, new_state}
+    new_config = Keyword.drop(config, [:index])
+    {:reply, :ok, struct(state, new_config)}
   end
 
   def handle_call(:attach, _from, state) do
@@ -141,19 +179,32 @@ defmodule RingLogger.Client do
     {:reply, Server.detach_client(self()), state}
   end
 
-  def handle_call(:tail, _from, state) do
-    messages = Server.get(state.index)
-
-    case List.last(messages) do
-      nil ->
+  def handle_call(:next, _from, state) do
+    case Server.get(state.index, 0) do
+      [] ->
         # No messages
-        {:reply, :ok, state}
+        {:reply, {state.io, []}, state}
 
-      last_message ->
-        Enum.each(messages, fn msg -> maybe_print(msg, state) end)
+      messages ->
+        to_return =
+          messages
+          |> Enum.filter(fn message -> should_print?(message, state) end)
+          |> Enum.map(fn message -> format_message(message, state) end)
+
+        last_message = List.last(messages)
         next_index = message_index(last_message) + 1
-        {:reply, :ok, %{state | index: next_index}}
+
+        {:reply, {state.io, to_return}, %{state | index: next_index}}
     end
+  end
+
+  def handle_call({:tail, n}, _from, state) do
+    to_return =
+      Server.tail(n)
+      |> Enum.filter(fn message -> should_print?(message, state) end)
+      |> Enum.map(fn message -> format_message(message, state) end)
+
+    {:reply, {state.io, to_return}, state}
   end
 
   def handle_call(:reset, _from, state) do
@@ -161,10 +212,14 @@ defmodule RingLogger.Client do
   end
 
   def handle_call({:grep, regex}, _from, state) do
-    Server.get()
-    |> Enum.each(fn msg -> maybe_print(msg, regex, state) end)
+    to_return =
+      Server.get(0, 0)
+      |> Enum.filter(fn message -> should_print?(message, state) end)
+      |> Enum.map(fn message -> format_message(message, state) end)
+      |> Enum.map(&IO.iodata_to_binary/1)
+      |> Enum.filter(&Regex.match?(regex, &1))
 
-    {:reply, :ok, state}
+    {:reply, {state.io, to_return}, state}
   end
 
   def handle_call({:format, msg}, _from, state) do
@@ -185,11 +240,20 @@ defmodule RingLogger.Client do
       end
 
     state.format
-    |> Logger.Formatter.format(level, msg, ts, metadata)
+    |> apply_format(level, msg, ts, metadata)
     |> color_event(level, state.colors, md)
   end
 
   ## Helpers
+
+  defp apply_format({mod, fun}, level, msg, ts, metadata) do
+    apply(mod, fun, [level, msg, ts, metadata])
+  end
+
+  defp apply_format(format, level, msg, ts, metadata) do
+    Logger.Formatter.format(format, level, msg, ts, metadata)
+  end
+
   defp configure_metadata(:all), do: :all
   defp configure_metadata(metadata), do: Enum.reverse(metadata)
 
@@ -206,6 +270,7 @@ defmodule RingLogger.Client do
   end
 
   defp meet_level?(_lvl, nil), do: true
+  defp meet_level?(_lvl, :none), do: false
 
   defp meet_level?(lvl, min) do
     Logger.compare_levels(lvl, min) != :lt
@@ -229,17 +294,35 @@ defmodule RingLogger.Client do
     [IO.ANSI.format_fragment(color, true), data | IO.ANSI.reset()]
   end
 
-  defp maybe_print({level, _} = msg, state) do
-    if meet_level?(level, state.level) do
+  defp configure_formatter({mod, fun}), do: {mod, fun}
+
+  defp configure_formatter(format) do
+    Logger.Formatter.compile(format)
+  end
+
+  defp maybe_print(msg, state) do
+    if should_print?(msg, state) do
       item = format_message(msg, state)
       IO.binwrite(state.io, item)
     end
   end
 
-  defp maybe_print({level, {_, text, _, _}} = msg, r, state) do
-    if meet_level?(level, state.level) && Regex.match?(r, text) do
-      item = format_message(msg, state)
-      IO.binwrite(state.io, item)
+  defp get_module_from_msg({_, {_, _, _, meta}}) do
+    Keyword.get(meta, :module)
+  end
+
+  defp should_print?({level, _} = msg, %State{module_levels: module_levels} = state) do
+    module = get_module_from_msg(msg)
+
+    with module_level when not is_nil(module_level) <- Map.get(module_levels, module),
+         true <- meet_level?(level, module_level) do
+      true
+    else
+      nil ->
+        meet_level?(level, state.level)
+
+      _ ->
+        false
     end
   end
 

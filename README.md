@@ -23,7 +23,7 @@ Add `ring_logger` to your projects dependencies in your `mix.exs`:
 
 ```elixir
   def deps do
-    [{:ring_logger, "~> 0.4"}]
+    [{:ring_logger, "~> 0.6"}]
   end
 ```
 
@@ -37,14 +37,14 @@ use Mix.Config
 config :logger, backends: [RingLogger]
 
 # Set the number of messages to hold in the circular buffer
-config :logger, RingLogger, max_size: 100
+config :logger, RingLogger, max_size: 1024
 ```
 
 Or you can start the backend manually by running the following:
 
 ```elixir
 Logger.add_backend(RingLogger)
-Logger.configure(RingLogger, max_size: 100)
+Logger.configure(RingLogger, max_size: 1024)
 ```
 
 ## IEx session usage
@@ -80,7 +80,7 @@ This probably isn't too exciting until you see that it works on remote shells as
 well (the `:console` logger doesn't do this).
 
 Say you prefer polling for log messages rather than having them print over your
-console at random times. If you're still attached, then `detach` and `tail`:
+console at random times. If you're still attached, then `detach` and `next`:
 
 ```elixir
 iex> RingLogger.detach
@@ -89,6 +89,21 @@ iex> Logger.info("Hello logger, how are you?")
 :ok
 iex> Logger.info("It's a nice day. Wouldn't you say?")
 :ok
+iex> RingLogger.next
+
+14:04:52.516 [info]  hello
+
+14:11:54.397 [info]  Hello logger, how are you?
+
+14:12:09.180 [info]  It's a nice day. Wouldn't you say?
+:ok
+iex> RingLogger.next
+:ok
+```
+
+If you only want to see the most recent entries, run `tail`:
+
+```elixir
 iex> RingLogger.tail
 
 14:04:52.516 [info]  hello
@@ -98,6 +113,82 @@ iex> RingLogger.tail
 14:12:09.180 [info]  It's a nice day. Wouldn't you say?
 :ok
 ```
+
+You can also `grep`:
+
+```elixir
+iex> RingLogger.grep(~r/[Nn]eedle/)
+
+16:55:41.614 [info]  Needle in a haystack
+```
+
+## Module Level Filtering
+
+If you want to filter a module or modules at a particular level you pass
+a map where the key is the module name and value in the level into the
+`:module_levels` option to `RingLogger.attach/1`.
+
+For example:
+
+```elixir
+iex> RingLogger.attach(module_levels: %{MyModule => :info})
+```
+
+This will ignore all the `:debug` messages from `MyModule`.
+
+Also, it allows for filtering the whole project on a higher level,
+but a particular module, or a subset of modules, to log at a lower
+level like so:
+
+```elixir
+iex> RingLogger.attach(module_levels: %{MyModule => :debug}, level: :warn)
+```
+
+In the example above log messages at the `:debug` level will be logged,
+but every other module will be logging at the `:warn` level. You can also
+turn off a module's logging completely by specifying `:none`.
+
+As a note if the Elixir `Logger` level is set too low you will miss some
+log messages.
+
+## Formatting
+
+If you want to use a specific string format with the built in Elixir
+Logger.Formatter, you can pass that as the `:format` option to
+`RingLogger.attach/1`.
+
+If you want to use a custom formatter function, you can pass it through the
+`:format` option to `RingLogger.attach/1` instead.
+
+For example, to print the file and line number of each log message, you could
+define a function as follows:
+
+```elixir
+defmodule CustomFormatter do
+  def format(_level, message, _timestamp, metadata) do
+    "#{message} #{metadata[:file]}:#{metadata[:line]}\n"
+  rescue
+    _ -> message
+  end
+end
+```
+
+and attach to the RingLogger with:
+
+```elixir
+iex> RingLogger.attach(format: {CustomFormatter, :format}, metadata: [:file, :line])
+:ok
+iex> require Logger
+Logger
+iex> Logger.info("Important message!")
+:ok
+Important message! iex:4
+```
+
+Within an application, the `iex:4` would be the source file path and line number.
+
+See [Logger custom formatting](https://hexdocs.pm/logger/Logger.html#module-custom-formatting)
+for more information.
 
 ## Programmatic usage
 
